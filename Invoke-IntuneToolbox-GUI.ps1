@@ -42,7 +42,7 @@ v2.1 - Added App Management Replace: previewed, add-first replacement of same-in
       Tab 3 - Setting Search     : Find settings across loaded Settings Catalog profiles.
       Tab 4 - Duplicate Devices  : Identify duplicate Windows records and manually remove eligible stale records.
       Tab 5 - Audit Lookup       : Search historical Intune changes by user and target name.
-      Tab 6 - App Management     : Load apps, filter inventory columns, bulk assign or replace, and inspect/edit/remove direct assignments.
+      Tab 6 - App Management     : Load/filter apps, set Win32 available uninstall, bulk assign/replace, and inspect/edit/remove assignments.
 
 .EXAMPLE
     Interactive (user) authentication:
@@ -1846,6 +1846,7 @@ $script:GraphState = [hashtable]::Synchronized(@{
                                             <GridViewColumn Header="App type" DisplayMemberBinding="{Binding AppType}" Width="145"/>
                                             <GridViewColumn Header="Publisher" DisplayMemberBinding="{Binding Publisher}" Width="125"/>
                                             <GridViewColumn Header="Assignments (hint)" DisplayMemberBinding="{Binding AssignmentStatus}" Width="145"/>
+                                            <GridViewColumn Header="Allow available uninstall" DisplayMemberBinding="{Binding AllowAvailableUninstallDisplay}" Width="175"/>
                                         </GridView>
                                     </ListView.View>
                                 </ListView>
@@ -1868,6 +1869,19 @@ $script:GraphState = [hashtable]::Synchronized(@{
                     </Grid>
                     <ScrollViewer Grid.Column="2" VerticalScrollBarVisibility="Auto">
                         <StackPanel x:Name="PanelAppActions">
+                            <GroupBox Header="Win32 app settings" Margin="0,0,0,8">
+                                <StackPanel>
+                                    <Label Content="Allow available uninstall"/>
+                                    <ComboBox x:Name="ComboAppAvailableUninstall" SelectedIndex="-1">
+                                        <ComboBoxItem Content="Yes" Tag="Yes"/>
+                                        <ComboBoxItem Content="No" Tag="No"/>
+                                    </ComboBox>
+                                    <Button x:Name="BtnAppAvailableUninstall" Content="Apply to selected Win32 apps"
+                                            Style="{StaticResource PrimaryBtn}" Margin="0,8,0,0"/>
+                                    <TextBlock Text="Allows Company Portal uninstall for available Win32 apps. Other selected app types are skipped. Assignments and uninstall commands are not changed."
+                                               TextWrapping="Wrap" Foreground="{DynamicResource SubTextBrush}" FontSize="11" Margin="0,6,0,0"/>
+                                </StackPanel>
+                            </GroupBox>
                             <GroupBox Header="Assignment target and intent">
                                 <StackPanel>
                                     <Label Content="Intent"/>
@@ -4454,6 +4468,7 @@ foreach ($name in @(
     'TxtAppNameFilter', 'ComboAppPlatform', 'BtnAppLoad', 'TxtAppCount', 'ListApps', 'TxtAppEmpty',
     'PanelAppResultFilters', 'TxtAppResultName', 'TxtAppResultPublisher', 'ComboAppResultPlatform',
     'ComboAppResultType', 'ComboAppResultStatus', 'BtnAppClearResultFilters',
+    'ComboAppAvailableUninstall', 'BtnAppAvailableUninstall',
     'AppActivityExpander', 'TxtAppActivitySummary', 'AppLogScroll', 'TxtAppLog', 'PanelAppActions',
     'ComboAppIntent', 'ComboAppTarget', 'ComboAppIncludeExclude', 'TxtAppGroupSearch', 'BtnAppGroupSearch',
     'ListAppGroups', 'BtnAppQueue', 'ListAppQueuedGroups', 'BtnAppUnqueue', 'BtnAppClearQueue',
@@ -4488,6 +4503,7 @@ function Clear-AppInspection {
 function Clear-AppManagement {
     Clear-AppInspection
     $script:AppState.Tenant = ''
+    $AppUI.ComboAppAvailableUninstall.SelectedIndex = -1
     Reset-AppInventory
     foreach ($control in @('ListAppGroups', 'ListAppQueuedGroups', 'ComboAppFilter')) { $AppUI[$control].Items.Clear() }
     Update-AppState
@@ -4577,6 +4593,9 @@ function Update-AppState {
     $inspected = $selected.Count -eq 1 -and $script:AppState.InspectedAppId -eq $selected[0].Id
     $direct = $assignments.Count -gt 0 -and @($assignments | Where-Object { -not $_.Editable }).Count -eq 0
     $idle = -not $script:AppState.Busy
+    $AppUI.BtnAppAvailableUninstall.IsEnabled = $idle -and
+        @($selected | Where-Object AppType -eq 'win32LobApp').Count -gt 0 -and
+        (Get-SelectedTag $AppUI.ComboAppAvailableUninstall) -in @('Yes', 'No')
     $AppUI.PanelAppResultFilters.IsEnabled = $idle
     $AppUI.TxtAppCount.Text = if ($script:AppState.InventoryLoaded) {
         "$($AppUI.ListApps.Items.Count) visible / $($script:AppState.Inventory.Count) loaded / $($selected.Count) selected. Assignment status is a Graph hint."
@@ -4819,6 +4838,55 @@ function Confirm-AppAssignment {
     return [System.Windows.MessageBox]::Show($window, $Message, "Confirm app assignment $Action", 'YesNo', 'Warning', 'No') -eq 'Yes'
 }
 
+function Confirm-AppAvailableUninstall {
+    param([string]$Message)
+    if ($ValidateOnly) { return $false }
+    return [System.Windows.MessageBox]::Show($window, $Message, 'Confirm Allow available uninstall', 'YesNo', 'Warning', 'No') -eq 'Yes'
+}
+
+function Invoke-AppAvailableUninstall {
+    Update-AppState
+    if (-not $AppUI.BtnAppAvailableUninstall.IsEnabled) {
+        Write-AppLog 'Select Win32 apps and an explicit Yes/No value before applying.' 'WARN'; return
+    }
+    $apps = @($AppUI.ListApps.SelectedItems)
+    $eligible = @($apps | Where-Object AppType -eq 'win32LobApp')
+    $value = Get-SelectedTag $AppUI.ComboAppAvailableUninstall
+    $appDetails = @($eligible | ForEach-Object { "$($_.DisplayName) [$($_.Id)]" }) -join "`n"
+    Write-AppLog "Allow available uninstall = $value confirmation requested:`n$appDetails"
+    $message = "Tenant: $($apps[0].TenantId)`nSet Allow available uninstall to $value for $($eligible.Count) Win32 app(s):`n$appDetails`n`n$($apps.Count - $eligible.Count) non-Win32 app(s) will be skipped.`nAssignments and uninstall commands are unchanged. Bulk operations are not atomic. Continue?"
+    if (-not (Confirm-AppAvailableUninstall -Message $message)) {
+        Write-AppLog 'Win32 setting operation cancelled.' 'WARN'; return
+    }
+    $parameters = @{ Apps = $apps; TenantId = $apps[0].TenantId; AllowAvailableUninstall = ($value -eq 'Yes') }
+    $script:AppState.Results.Clear()
+    $state = $script:AppState
+    $complete = {
+        foreach ($app in $eligible) {
+            $outcomes = @($state.Results | Where-Object AppId -eq $app.Id)
+            if ($outcomes.Count -ne 1) {
+                $app.AllowAvailableUninstall = $null
+                $app.AllowAvailableUninstallDisplay = 'Unknown'
+                Write-AppLog "[$($app.DisplayName)] No verified outcome returned. Load apps again; see Activity." 'ERR'
+                continue
+            }
+            $row = $outcomes[0]
+            if ($row.Status -in @('OK', 'NoChange', 'Failed')) {
+                $app.AllowAvailableUninstall = $row.AllowAvailableUninstall
+                $app.AllowAvailableUninstallDisplay = $row.AllowAvailableUninstallDisplay
+            }
+        }
+        $failed = @($state.Results | Where-Object Status -eq 'Failed').Count
+        Write-AppLog "Win32 setting operation returned $($state.Results.Count) outcome(s), $failed failed. Successful changes are not rolled back." $(if ($failed) { 'WARN' } else { 'INFO' })
+        Update-AppResultFilter -PreserveSelection
+    }.GetNewClosure()
+    Start-AppWorker -Feature 'Set-IntuneAppAvailableUninstall.ps1' -Parameters $parameters `
+        -Scopes @('DeviceManagementApps.ReadWrite.All') -OutputAction { param($row) $script:AppState.Results.Add($row) } -Complete $complete
+}
+
+$AppUI.ComboAppAvailableUninstall.Add_SelectionChanged({ Update-AppState })
+$AppUI.BtnAppAvailableUninstall.Add_Click({ Invoke-AppAvailableUninstall })
+
 $AppUI.BtnAppLoad.Add_Click({
     if ($script:AppState.Busy) { Write-AppLog 'Wait for the current app operation.' 'WARN'; return }
     Reset-AppInventory -Message 'Loading apps...'
@@ -4949,6 +5017,7 @@ if ($ValidateOnly) {
         'Features\Get-IntuneProfiles.ps1',
         'Features\Get-IntuneApps.ps1',
         'Features\Invoke-IntuneAppAssignment.ps1',
+        'Features\Set-IntuneAppAvailableUninstall.ps1',
         'Shared\IntuneAppHelpers.ps1',
         'Features\Invoke-IntuneProfileAssignment.ps1',
         'Features\Rename-IntuneProfiles.ps1',

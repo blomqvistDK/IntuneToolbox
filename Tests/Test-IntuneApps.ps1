@@ -9,7 +9,7 @@ function Assert-AppTest {
     $script:checks++
     Write-Host "PASS: $Message"
 }
-foreach ($path in @('Features\Get-IntuneApps.ps1', 'Features\Invoke-IntuneAppAssignment.ps1', 'Shared\IntuneAppHelpers.ps1')) {
+foreach ($path in @('Features\Get-IntuneApps.ps1', 'Features\Invoke-IntuneAppAssignment.ps1', 'Features\Set-IntuneAppAvailableUninstall.ps1', 'Shared\IntuneAppHelpers.ps1')) {
     $errors = $null
     [void][Management.Automation.Language.Parser]::ParseFile((Join-Path $root $path), [ref]$null, [ref]$errors)
     Assert-AppTest ($errors.Count -eq 0) "App feature syntax: $path"
@@ -23,7 +23,7 @@ $otherGroupId = '66666666-6666-6666-6666-666666666666'
 $mock = @{
     Tenant = $tenant; Scopes = @('DeviceManagementApps.ReadWrite.All', 'Group.Read.All')
     Apps = @(
-        @{ id = $appId; displayName = 'Windows [Pilot]'; publisher = 'Publisher'; '@odata.type' = '#microsoft.graph.win32LobApp'; isAssigned = $true },
+        @{ id = $appId; displayName = 'Windows [Pilot]'; publisher = 'Publisher'; '@odata.type' = '#microsoft.graph.win32LobApp'; isAssigned = $true; allowAvailableUninstall = $false },
         @{ id = '77777777-7777-7777-7777-777777777777'; displayName = 'Store'; '@odata.type' = '#microsoft.graph.winGetApp' },
         @{ id = '88888888-8888-8888-8888-888888888888'; displayName = 'iPad'; '@odata.type' = '#microsoft.graph.iosVppApp' },
         @{ id = '99999999-9999-9999-9999-999999999999'; displayName = 'Android'; '@odata.type' = '#microsoft.graph.androidManagedStoreApp' },
@@ -37,6 +37,9 @@ $mock = @{
     Reads = [System.Collections.Generic.List[string]]::new()
     FailPage = $false; FailRead = $false; FailWrite = $false; Ambiguous = $false; MissingGroup = $false
     Retry = $false; Sleeps = 0; FailGroup = ''
+    IgnoreSettingWrite = $false; FailSettingVerification = $false; SettingWritten = $false
+    FailSettingApp = ''; RetrySettingWrite = $false
+    WrongSettingIdentity = $false
 }
 function Get-MgContext { [PSCustomObject]@{ TenantId = $mock.Tenant; Scopes = $mock.Scopes; Account = 'offline@example.test' } }
 function Connect-MgGraph { throw 'Unexpected authentication in offline app tests.' }
@@ -49,6 +52,14 @@ function Invoke-MgGraphRequest {
     if ($uriText -like "*mobileApps/$($mock.Apps[1].id)/*") { $collection = $mock.OtherAssignments }
     if ($Method -in @('POST', 'PATCH', 'DELETE')) {
         $mock.Writes.Add([PSCustomObject]@{ Method = $Method; Uri = $uriText; Body = $Body })
+        if ($Method -eq 'PATCH' -and $uriText -match '/mobileApps/([^/?]+)$') {
+            if ($mock.FailSettingApp -eq $Matches[1]) { throw '403 Forbidden writing Win32 setting' }
+            if ($mock.RetrySettingWrite) { $mock.RetrySettingWrite = $false; throw '503 ServiceUnavailable' }
+            $settingApp = @($mock.Apps | Where-Object id -eq $Matches[1])[0]
+            if (-not $mock.IgnoreSettingWrite) { $settingApp.allowAvailableUninstall = ($Body | ConvertFrom-Json).allowAvailableUninstall }
+            $mock.SettingWritten = $true
+            return
+        }
         if ($mock.FailWrite) { throw '403 Forbidden writing app assignment' }
         if ($Body -and $mock.FailGroup -and ($Body | ConvertFrom-Json).target.groupId -eq $mock.FailGroup) { throw '400 Incompatible group assignment' }
         if ($Method -eq 'POST') {
@@ -86,7 +97,13 @@ function Invoke-MgGraphRequest {
         return @{ value = @($collection | Select-Object -First 1); '@odata.nextLink' = "$uriText`?page=2" }
     }
     if ($uriText -like '*mobileApps/*') {
+        if ($mock.SettingWritten -and $mock.FailSettingVerification) { throw '403 Forbidden verifying Win32 setting' }
         $selectedId = ($uriText -split '/')[-1]
+        if ($mock.WrongSettingIdentity) {
+            $wrong = @($mock.Apps | Where-Object id -eq $selectedId)[0].Clone()
+            $wrong.id = $otherGroupId
+            return $wrong
+        }
         return @($mock.Apps | Where-Object id -eq $selectedId)[0]
     }
     if ($uriText -like '*assignmentFilters*' -or $uriText -like '*groups*') {
@@ -126,6 +143,92 @@ $mock.Retry = $true
 [void](& $get @common)
 Assert-AppTest ($mock.Sleeps -eq 1) 'App inventory uses shared transient-read retry'
 $app = $inventory.Rows[0]
+$settingScript = Join-Path $root 'Features\Set-IntuneAppAvailableUninstall.ps1'
+Assert-AppTest ($app.AllowAvailableUninstall -eq $false -and $app.AllowAvailableUninstallDisplay -eq 'No' -and
+    $inventory.Rows[1].AllowAvailableUninstallDisplay -eq 'N/A' -and $null -eq $inventory.Rows[1].AllowAvailableUninstall) 'Inventory preserves false and marks non-Win32 values N/A'
+$originalApps = $mock.Apps
+$mock.Apps = @(
+    @{ id = $appId; displayName = 'Yes'; '@odata.type' = '#microsoft.graph.win32LobApp'; allowAvailableUninstall = $true },
+    @{ id = $originalApps[1].id; displayName = 'No'; '@odata.type' = '#microsoft.graph.win32LobApp'; allowAvailableUninstall = $false },
+    @{ id = $originalApps[2].id; displayName = 'Unknown'; '@odata.type' = '#microsoft.graph.win32LobApp' }
+)
+$settingsInventory = & $get @common
+Assert-AppTest ($settingsInventory.Rows[0].AllowAvailableUninstallDisplay -eq 'Yes' -and
+    $settingsInventory.Rows[1].AllowAvailableUninstallDisplay -eq 'No' -and
+    $settingsInventory.Rows[2].AllowAvailableUninstallDisplay -eq 'Unknown' -and
+    $null -eq $settingsInventory.Rows[2].AllowAvailableUninstall) 'Win32 inventory displays true, false and missing values across pages'
+$mock.Apps = $originalApps
+$settingParameters = @{ Apps = @($app); AllowAvailableUninstall = $true; Confirm = $false }
+$result = & $settingScript @common @settingParameters -WhatIf
+Assert-AppTest ($result.Status -eq 'WhatIf' -and $mock.Writes.Count -eq 0) 'Win32 setting WhatIf makes no writes'
+$mock.RetrySettingWrite = $true
+$sleepsBefore = $mock.Sleeps
+$result = & $settingScript @common @settingParameters
+$settingPayload = $mock.Writes[1].Body | ConvertFrom-Json
+Assert-AppTest ($result.Status -eq 'OK' -and $result.AllowAvailableUninstall -eq $true -and
+    $settingPayload.allowAvailableUninstall -is [bool] -and $settingPayload.allowAvailableUninstall -eq $true -and
+    $settingPayload.'@odata.type' -eq '#microsoft.graph.win32LobApp' -and $settingPayload.PSObject.Properties.Name.Count -eq 2 -and
+    $mock.Writes[1].Uri -like "*/mobileApps/$appId" -and $mock.Sleeps -eq ($sleepsBefore + 1)) 'Win32 setting uses an idempotent retry, minimal Boolean PATCH and verified read-back'
+$beforeSettingWrites = $mock.Writes.Count
+$result = & $settingScript @common -Apps @($app, $app, $inventory.Rows[1]) -AllowAvailableUninstall $true -Confirm:$false
+Assert-AppTest ($result.Count -eq 2 -and $result[0].Status -eq 'NoChange' -and $result[1].Status -eq 'Skipped' -and
+    $mock.Writes.Count -eq $beforeSettingWrites) 'Matching settings are no-ops, duplicates are deduplicated and Store apps are skipped'
+$result = & $settingScript @common -Apps @($app) -AllowAvailableUninstall $false -Confirm:$false
+Assert-AppTest ($result.Status -eq 'OK' -and $result.AllowAvailableUninstallDisplay -eq 'No' -and
+    $mock.Apps[0].allowAvailableUninstall -eq $false) 'Win32 available uninstall can be explicitly disabled'
+$mock.IgnoreSettingWrite = $true
+$result = & $settingScript @common @settingParameters
+Assert-AppTest ($result.Status -eq 'Failed' -and $result.AllowAvailableUninstall -eq $false -and
+    $result.AllowAvailableUninstallDisplay -eq 'No') 'Read-back mismatch is failure and returns the observed value, not the requested value'
+$mock.IgnoreSettingWrite = $false
+$mock.SettingWritten = $false; $mock.FailSettingVerification = $true
+$result = & $settingScript @common @settingParameters
+Assert-AppTest ($result.Status -eq 'Failed' -and $null -eq $result.AllowAvailableUninstall -and
+    $result.AllowAvailableUninstallDisplay -eq 'Unknown' -and $result.Message -like '*write was attempted*') 'Read-back failure reports uncertain persistence and Unknown instead of success'
+$mock.FailSettingVerification = $false; $mock.SettingWritten = $false
+$mock.Apps[0].allowAvailableUninstall = $false
+$mock.Apps[0].'@odata.type' = '#microsoft.graph.winGetApp'
+$beforeSettingWrites = $mock.Writes.Count
+$result = & $settingScript @common @settingParameters
+Assert-AppTest ($result.Status -eq 'Failed' -and $mock.Writes.Count -eq $beforeSettingWrites) 'Fresh app type verification blocks stale Win32 inventory writes'
+$mock.Apps[0].'@odata.type' = '#microsoft.graph.win32LobApp'
+$mock.WrongSettingIdentity = $true
+$beforeSettingWrites = $mock.Writes.Count
+$result = & $settingScript @common @settingParameters
+Assert-AppTest ($result.Status -eq 'Failed' -and $mock.Writes.Count -eq $beforeSettingWrites) 'Fresh identity mismatch blocks Win32 property writes'
+$mock.WrongSettingIdentity = $false
+$mock.Apps[0].Remove('allowAvailableUninstall')
+$result = & $settingScript @common -Apps @($app) -AllowAvailableUninstall $false -Confirm:$false
+Assert-AppTest ($result.Status -eq 'OK' -and $mock.Writes.Count -eq ($beforeSettingWrites + 1) -and
+    $result.AllowAvailableUninstall -eq $false) 'Missing current setting is not silently treated as No and can be explicitly updated'
+$mock.Apps[1].'@odata.type' = '#microsoft.graph.win32LobApp'; $mock.Apps[1].allowAvailableUninstall = $false
+$secondWin32 = [PSCustomObject]@{ Id = $mock.Apps[1].id; DisplayName = 'Second Win32'; TenantId = $tenant; AppType = 'win32LobApp' }
+$mock.FailSettingApp = $appId
+$result = & $settingScript @common -Apps @($app, $secondWin32) -AllowAvailableUninstall $true -Confirm:$false
+Assert-AppTest ($result[0].Status -eq 'Failed' -and $result[1].Status -eq 'OK' -and
+    $mock.Apps[1].allowAvailableUninstall -eq $true) 'Per-app setting failure does not stop another Win32 app from updating'
+$mock.FailSettingApp = ''
+$mock.Apps[1].'@odata.type' = '#microsoft.graph.winGetApp'; $mock.Apps[1].Remove('allowAvailableUninstall')
+foreach ($invalid in @(
+    [PSCustomObject]@{ Id = 'invalid'; TenantId = $tenant; AppType = 'win32LobApp' },
+    [PSCustomObject]@{ Id = $appId; TenantId = $otherGroupId; AppType = 'win32LobApp' }
+)) {
+    $failed = $false; $beforeSettingWrites = $mock.Writes.Count
+    try { & $settingScript @common -Apps @($app, $invalid) -AllowAvailableUninstall $true -Confirm:$false | Out-Null } catch { $failed = $true }
+    Assert-AppTest ($failed -and $mock.Writes.Count -eq $beforeSettingWrites) 'Invalid/different-tenant selections are rejected before any setting writes'
+}
+$mock.Tenant = $otherGroupId
+$failed = $false
+try { & $settingScript @common @settingParameters -TenantId $tenant | Out-Null } catch { $failed = $true }
+Assert-AppTest $failed 'Win32 setting rejects a changed Graph tenant'
+$mock.Tenant = $tenant
+$originalScopes = $mock.Scopes; $mock.Scopes = @('DeviceManagementApps.Read.All')
+$failed = $false
+try { & $settingScript @common @settingParameters | Out-Null } catch { $failed = $true }
+Assert-AppTest $failed 'Win32 setting requires Apps ReadWrite permission'
+$mock.Scopes = $originalScopes
+$mock.Writes.Clear(); $mock.Apps[0].allowAvailableUninstall = $false
+$mock.SettingWritten = $false
 $group = [PSCustomObject]@{ Id = $groupId; DisplayName = 'Pilot group' }
 $group2 = [PSCustomObject]@{ Id = $otherGroupId; DisplayName = 'Other group' }
 $filter = [PSCustomObject]@{ Id = $filterId; DisplayName = 'Windows'; Platform = 'windows10' }
@@ -491,5 +594,59 @@ try {
     Assert-AppTest ($AppUI.ListApps.Items.Count -eq 0 -and $AppUI.ListAppQueuedGroups.Items.Count -eq 0 -and
         $script:AppState.Inventory.Count -eq 0 -and -not $script:AppState.InventoryLoaded -and
         $AppUI.ComboAppResultType.Items.Count -eq 1 -and $AppUI.TxtAppEmpty.Text -eq 'No apps loaded.') 'Sign-out cleanup clears cached inventory, result filters, inspection and target queues'
+
+    $uninstallColumn = @($AppUI.ListApps.View.Columns | Where-Object Header -eq 'Allow available uninstall')
+    Assert-AppTest ($uninstallColumn.Count -eq 1 -and
+        $uninstallColumn[0].DisplayMemberBinding.Path.Path -eq 'AllowAvailableUninstallDisplay' -and
+        $AppUI.ComboAppAvailableUninstall.SelectedIndex -eq -1 -and -not $AppUI.BtnAppAvailableUninstall.IsEnabled) 'Uninstall column binds display values and the setting picker has no default'
+    $script:AppState.Inventory = @($app, $inventory.Rows[1]); $script:AppState.InventoryLoaded = $true
+    Update-AppResultFilterOptions -Reset; Update-AppResultFilter
+    $AppUI.ListApps.SelectedItem = $app
+    Assert-AppTest (-not $AppUI.BtnAppAvailableUninstall.IsEnabled) 'Win32 selection alone cannot apply a setting without an explicit value'
+    $AppUI.ListApps.UnselectAll()
+    Select-AppComboTag $AppUI.ComboAppAvailableUninstall 'Yes'
+    $AppUI.ListApps.SelectedItem = $inventory.Rows[1]
+    Assert-AppTest (-not $AppUI.BtnAppAvailableUninstall.IsEnabled) 'Non-Win32-only selection cannot apply the setting'
+    [void]$AppUI.ListApps.SelectedItems.Add($app)
+    Assert-AppTest $AppUI.BtnAppAvailableUninstall.IsEnabled 'Mixed selection with a Win32 app can apply an explicit setting'
+    $script:confirmUninstall = $false
+    function Confirm-AppAvailableUninstall { param($Message) $script:uninstallMessage = $Message; return $script:confirmUninstall }
+    $script:pendingAppWorker = $null
+    $AppUI.BtnAppAvailableUninstall.RaiseEvent([System.Windows.RoutedEventArgs]::new($click))
+    Assert-AppTest ($null -eq $pendingAppWorker -and $uninstallMessage -like '*to Yes*' -and
+        $uninstallMessage -like "*$appId*" -and $uninstallMessage -like '*1 non-Win32*' -and
+        $uninstallMessage -like "*$tenant*") 'Setting confirmation lists value, eligible IDs, tenant and skips; cancellation starts no worker'
+    $script:confirmUninstall = $true
+    $assignmentHint = $app.AssignmentStatus
+    $sortCount = $AppUI.ListApps.Items.SortDescriptions.Count
+    $AppUI.BtnAppAvailableUninstall.RaiseEvent([System.Windows.RoutedEventArgs]::new($click))
+    $settingWorker = $pendingAppWorker
+    Assert-AppTest ($script:AppState.Busy -and -not $AppUI.BtnAppAvailableUninstall.IsEnabled -and
+        -not $AppUI.PanelAppActions.IsEnabled -and $settingWorker.Worker.Parameters.AllowAvailableUninstall -is [bool] -and
+        $settingWorker.Worker.Parameters.AllowAvailableUninstall -eq $true -and $settingWorker.Worker.Parameters.Apps.Count -eq 2 -and
+        $settingWorker.Worker.Scopes -contains 'DeviceManagementApps.ReadWrite.All' -and
+        $settingWorker.Worker.FeaturePath -like '*Set-IntuneAppAvailableUninstall.ps1') 'Confirmed Win32 setting snapshots a Boolean and mixed selection with Apps Write scope while locking the UI'
+    & $settingWorker.Worker.OutputAction ([PSCustomObject]@{ AppId = $appId; Status = 'OK'; AllowAvailableUninstall = $true; AllowAvailableUninstallDisplay = 'Yes' })
+    & $settingWorker.Worker.OutputAction ([PSCustomObject]@{ AppId = $inventory.Rows[1].Id; Status = 'Skipped'; AllowAvailableUninstall = $null; AllowAvailableUninstallDisplay = 'N/A' })
+    & $settingWorker.Complete
+    Assert-AppTest ($app.AllowAvailableUninstallDisplay -eq 'Yes' -and $app.AllowAvailableUninstall -eq $true -and
+        $app.AssignmentStatus -eq $assignmentHint -and $AppUI.ListApps.SelectedItems.Count -eq 2 -and
+        $AppUI.ListApps.Items.SortDescriptions.Count -eq $sortCount -and -not $script:AppState.Busy) 'Setting completion refreshes verified values and preserves selection/sorting without changing assignment status'
+    Select-AppComboTag $AppUI.ComboAppAvailableUninstall 'No'
+    Invoke-AppAvailableUninstall
+    Assert-AppTest ($pendingAppWorker.Worker.Parameters.AllowAvailableUninstall -eq $false) 'No picker passes Boolean false instead of a truthy string'
+    & $pendingAppWorker.Worker.OutputAction ([PSCustomObject]@{ AppId = $appId; Status = 'Failed'; AllowAvailableUninstall = $null; AllowAvailableUninstallDisplay = 'Unknown' })
+    & $pendingAppWorker.Complete
+    Assert-AppTest ($null -eq $app.AllowAvailableUninstall -and $app.AllowAvailableUninstallDisplay -eq 'Unknown') 'Unverified failure invalidates the old UI value'
+    $app.AllowAvailableUninstall = $true; $app.AllowAvailableUninstallDisplay = 'Yes'
+    $AppUI.TxtAppResultPublisher.Text = 'publisher'
+    $AppUI.ListApps.SelectedItem = $app
+    Invoke-AppAvailableUninstall
+    & $pendingAppWorker.Complete
+    Assert-AppTest ($null -eq $app.AllowAvailableUninstall -and $app.AllowAvailableUninstallDisplay -eq 'Unknown' -and
+        $AppUI.TxtAppResultPublisher.Text -eq 'publisher' -and $AppUI.ListApps.Items.Count -eq 1 -and
+        $AppUI.ListApps.SelectedItem.Id -eq $appId) 'Missing worker outcomes invalidate cached values while preserving the active filter and selection'
+    Clear-AppManagement
+    Assert-AppTest ($AppUI.ComboAppAvailableUninstall.SelectedIndex -eq -1 -and -not $AppUI.BtnAppAvailableUninstall.IsEnabled) 'Sign-out cleanup clears the explicit Win32 setting choice'
 } finally { $ui.Window.Close() }
 Write-Host "Completed $checks app management checks."

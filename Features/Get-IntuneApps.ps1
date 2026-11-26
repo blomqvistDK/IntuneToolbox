@@ -26,9 +26,13 @@ if ($Action -eq 'Inventory') {
         $platform = Get-IntuneAppPlatform $app
         if ($PlatformFilter -ne 'All' -and $platform -ne $PlatformFilter) { continue }
         if ($NameFilter -and ([string]$app.displayName).IndexOf($NameFilter, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+        $appType = ([string]$app.'@odata.type' -replace '^#?microsoft\.graph\.', '')
+        $allowUninstall = if ($appType -eq 'win32LobApp' -and $app.allowAvailableUninstall -is [bool]) { $app.allowAvailableUninstall } else { $null }
         $rows.Add([PSCustomObject]@{
             Id = [string]$app.id; DisplayName = [string]$app.displayName; Publisher = [string]$app.publisher
-            AppType = ([string]$app.'@odata.type' -replace '^#?microsoft\.graph\.', '')
+            AppType = $appType
+            AllowAvailableUninstall = $allowUninstall
+            AllowAvailableUninstallDisplay = Format-IntuneAppAvailableUninstall -AppType $appType -Value $allowUninstall
             Platform = $platform; AssignmentStatus = if ($null -eq $app.isAssigned) { 'Unknown' } elseif ($app.isAssigned) { 'Assigned (hint)' } else { 'Unassigned (hint)' }
             TenantId = $tenant
         })

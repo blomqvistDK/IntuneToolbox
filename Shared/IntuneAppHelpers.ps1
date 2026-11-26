@@ -52,6 +52,14 @@ function Get-IntuneAppPlatform {
     }
 }
 
+function Format-IntuneAppAvailableUninstall {
+    param([string]$AppType, $Value)
+    if ($AppType -ne 'win32LobApp') { return 'N/A' }
+    if ($Value -isnot [bool]) { return 'Unknown' }
+    if ($Value) { return 'Yes' }
+    return 'No'
+}
+
 function ConvertTo-IntuneAppDictionary {
     param($Value)
     if ($null -eq $Value) { return $null }

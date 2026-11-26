@@ -9,6 +9,7 @@ IntuneToolbox/
 |   |-- Get-IntuneProfiles.ps1
 |   |-- Get-IntuneApps.ps1
 |   |-- Invoke-IntuneAppAssignment.ps1
+|   |-- Set-IntuneAppAvailableUninstall.ps1
 |   |-- Invoke-IntuneProfileAssignment.ps1
 |   |-- Rename-IntuneProfiles.ps1
 |   |-- Remove-IntuneProfiles.ps1
@@ -134,7 +135,11 @@ Both scripts support `-WhatIf` and emit per-profile status results. The GUI's re
 
 Open **App Management**, choose **All platforms** (default) or Windows, Android, iOS/iPadOS, or macOS, optionally enter a literal name substring, and click **Load apps**. Every Graph page is loaded; there is no app-type allowlist or result cap. Platform is derived from the app subtype. Unrecognized and platform-neutral types (such as generic web links) remain visible under All platforms. Inventory is limited by the administrator's RBAC visibility.
 
-Use **Filter loaded apps** above the results to narrow the list immediately without more Graph requests. For only Win32 apps, choose **App type = win32LobApp**. App name and Publisher match case-insensitive, literal substrings; Platform, App type, and Assignments (hint) use exact dropdown values from the loaded inventory. All criteria combine with **AND**. Counts show visible, loaded, and selected apps. **Clear filters** restores all loaded rows, but cannot restore apps excluded by the Name/Platform criteria used for **Load apps**. Changing result filters clears app selection and assignment inspection; sorting is preserved and apps are never selected automatically. A fresh load or sign-out clears result filters and cached results. Result filters are disabled while an app operation runs. Assignment status remains a Graph hint; after a mutation it becomes **Refresh required**, which can remove an app from a status-filtered view.
+The sortable **Allow available uninstall** column shows **Yes/No** for Win32 apps, **Unknown** if Graph does not return a Boolean, and **N/A** for other app types. To change it, select apps and choose an explicit **Yes** or **No** under **Win32 app settings**, then click **Apply to selected Win32 apps**. No value is preselected. The confirmation lists the tenant, new value, eligible apps and skipped count. Mixed selections skip non-Win32 apps and report them in Activity.
+
+This changes only the app-level `allowAvailableUninstall` property, which controls Company Portal uninstall for Win32 apps with an Available assignment. It does not uninstall apps, create/change assignments, or modify uninstall commands. Each app is freshly checked before updating; matching values are no-ops. Updates are read back before reporting success, and the column is refreshed with the observed value. Failed verification or missing outcomes show **Unknown**; a verified mismatching value is displayed but reported as a failure. See Activity and **Load apps** again before retrying uncertain changes. Successful changes are not rolled back if other apps fail.
+
+Use **Filter loaded apps** above the results to narrow the list immediately without more Graph requests. For only Win32 apps, choose **App type = win32LobApp**. App name and Publisher match case-insensitive, literal substrings; Platform, App type, and Assignments (hint) use exact dropdown values from the loaded inventory. All criteria combine with **AND**. Counts show visible, loaded, and selected apps. **Clear filters** restores all loaded rows, but cannot restore apps excluded by the Name/Platform criteria used for **Load apps**. Changing result filters clears app selection and assignment inspection; sorting is preserved and apps are never selected automatically. A fresh load or sign-out clears result filters and cached results. Result filters are disabled while an app operation runs. Assignment status remains a Graph hint; after an assignment mutation it becomes **Refresh required**, which can remove an app from a status-filtered view. Changing Allow available uninstall leaves this hint unchanged.
 
 Select apps with Ctrl/Shift. No apps are selected automatically. Choose Required, Available, or Uninstall; target Groups, All Users, or All Devices (default). To keep the right-hand panel short, group search and the queue appear only when the target is Groups, the filter picker appears only when a filter mode is chosen, and the existing-assignment list and its edit/remove buttons appear only after **Refresh assignments**. For groups, search, highlight results, and click **Add selected groups**. Repeat searches to build a persistent queue. **Every queued group is used**, regardless of highlighting; **Remove selected** and **Clear queue** edit that queue. Choose Include/Exclude and an optional device assignment filter. Filters cannot be attached to excluded groups; managed-app filters are not deployment filters.
 
@@ -164,11 +169,15 @@ Writes use assignment-level POST/PATCH/DELETE, not replacement of the full assig
 
 Inventory requests `DeviceManagementApps.Read.All`; mutations require `DeviceManagementApps.ReadWrite.All`. Group-name resolution/search uses `Group.Read.All`; loading filters uses `DeviceManagementConfiguration.Read.All`. Existing matching ReadWrite scopes satisfy Read scopes. The account additionally needs appropriate Intune Apps read/assign permissions, applicable licensing, and consent. The beta API is used for current app types and assignment-source metadata and may change. App creation/deletion, packaging, deployment reporting, and advanced assignment-settings editors are not included.
 
+Changing **Allow available uninstall** additionally requires Intune app update permissions (and `DeviceManagementApps.ReadWrite.All`). Its minimal app-level PATCH leaves other properties untouched. Bulk operations are not atomic, and concurrent administrator changes cannot be entirely prevented.
+
 Standalone examples (review selected IDs before removing `-WhatIf`):
 
 ```powershell
 $inventory = & .\Features\Get-IntuneApps.ps1 -PlatformFilter Windows -NameFilter 'Pilot' -PassThru
 $apps = @($inventory.Rows | Where-Object Id -eq '22222222-2222-2222-2222-222222222222')
+# Explicitly enable Company Portal available uninstall (preview only)
+& .\Features\Set-IntuneAppAvailableUninstall.ps1 -Apps $apps -AllowAvailableUninstall $true -TenantId $apps[0].TenantId -WhatIf -PassThru
 $groups = & .\Features\Search-IntuneAssignmentTargets.ps1 -Action Groups -SearchTerm 'Pilot' -PassThru
 $group = @($groups | Where-Object Id -eq '33333333-3333-3333-3333-333333333333')
 & .\Features\Invoke-IntuneAppAssignment.ps1 -Apps $apps -Action Add -Intent required -TargetGroup $group -WhatIf -PassThru
@@ -185,6 +194,8 @@ $plan | Format-Table AppName, Operation, Target, Message
 ```
 
 `Get-IntuneApps.ps1 -PassThru` returns a complete report with `Rows`, `Action`, `AppId`, and `TenantId`, including empty successes. Failed reads publish no partial report. Mutations return one status per app/target or selected assignment. Run `Tests\Test-IntuneApps.ps1` for focused offline app/WPF checks; the main `Tests\Test-IntuneToolbox.ps1` suite includes these checks. Tests make no live tenant changes.
+
+Inventory rows include nullable Boolean `AllowAvailableUninstall` and `AllowAvailableUninstallDisplay`. `Set-IntuneAppAvailableUninstall.ps1 -PassThru` returns one outcome per unique selected app: `AppId`, `AppName`, Boolean `RequestedValue`, nullable observed `AllowAvailableUninstall`, `AllowAvailableUninstallDisplay`, `Status`, and `Message`. Status is `OK`, `NoChange`, `Skipped`, `WhatIf`, or `Failed`; `OK` requires verified read-back. Use `$false` instead of `$true` to disable the setting.
 
 ### Autopilot Group Tags
 
